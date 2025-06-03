@@ -20,13 +20,19 @@ import warnings
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+import time # New Import
+# functools.lru_cache is removed as it's replaced by asyncache for specific classes
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union, Tuple
 
+from asyncache import cached, LRUCache
+
+from src.config import config # Ensure this import is present
+from src.logger import logger # Ensure this import is present
 from src.utils import (_is_package_available,
                        encode_image_base64,
                        make_image_url,
                        parse_json_blob)
-from src.logger import logger
+# Removed redundant logger import from here if it was already at top with config
 
 
 if TYPE_CHECKING:
@@ -609,9 +615,23 @@ class MLXModel(Model):
         tools_to_call_from: Optional[List[Any]] = None,
         **kwargs,
     ) -> ChatMessage:
-        completion_kwargs = self._prepare_completion_kwargs(
-            messages=messages,
-            stop_sequences=stop_sequences,
+        kwargs_for_key_func = {"stop_sequences": stop_sequences, "grammar": grammar, "tools_to_call_from": tools_to_call_from, **kwargs}
+        was_miss = False
+        if self._llm_cache_enabled:
+            log_cache_key = self._generate_llm_cache_key_for_inference_client(messages, stop_sequences, grammar, tools_to_call_from, **kwargs)
+            if self._llm_cache.get(log_cache_key, "CACHE_MISS_SENTINEL") != "CACHE_MISS_SENTINEL":
+                logger.debug(f"LLM call CACHE HIT for {self.model_id} (key: {str(log_cache_key)[:100]}...)")
+            else:
+                logger.debug(f"LLM call CACHE MISS for {self.model_id} (key: {str(log_cache_key)[:100]}...)")
+                was_miss = True
+        else:
+            was_miss = True
+
+        start_time = time.time()
+        try:
+            completion_kwargs = self._prepare_completion_kwargs(
+                messages=messages,
+                stop_sequences=stop_sequences,
             grammar=grammar,
             tools_to_call_from=tools_to_call_from,
             **kwargs,
@@ -899,6 +919,10 @@ class ApiModel(Model):
                 tool_call.function.arguments = parse_json_if_needed(tool_call.function.arguments)
         return message
 
+    # The __call__ method previously added to ApiModel with @lru_cache is removed.
+    # ApiModel will now inherit __call__ from Model class as it likely did before,
+    # or subclasses will implement their own. Caching is pushed down to subclasses.
+
 
 class LiteLLMModel(ApiModel):
     """Model to use [LiteLLM Python SDK](https://docs.litellm.ai/docs/#litellm-python-sdk) to access hundreds of LLMs.
@@ -943,6 +967,7 @@ class LiteLLMModel(ApiModel):
             if flatten_messages_as_text is not None
             else model_id.startswith(("ollama", "groq", "cerebras"))
         )
+        self._llm_cache = LRUCache(maxsize=128) # New Cache Instance
         super().__init__(
             model_id=model_id,
             custom_role_conversions=custom_role_conversions,
@@ -1066,12 +1091,99 @@ class InferenceClientModel(ApiModel):
             token = os.getenv("HF_TOKEN")
         self.client_kwargs = {
             **(client_kwargs or {}),
-            "model": model_id,
+            "model": model_id, # Effectively self.model_id for the client
             "provider": provider,
-            "token": token,
+            "token": token, # Will be omitted from cache key
             "timeout": timeout,
         }
+        # Initialize cache based on global config
+        self._llm_cache_enabled = config.llm_caching_enabled
+        cache_maxsize = config.llm_cache_maxsize if self._llm_cache_enabled else 0
+        self._llm_cache = LRUCache(maxsize=cache_maxsize)
         super().__init__(model_id=model_id, custom_role_conversions=custom_role_conversions, **kwargs)
+
+    def _generate_llm_cache_key_for_inference_client(
+        self,
+        messages: List[Dict[str, Any]],
+        stop_sequences: Optional[List[str]] = None,
+        grammar: Optional[str] = None,
+        tools_to_call_from: Optional[List[Any]] = None,
+        **kwargs_call: Any
+    ) -> Tuple[Any, ...]:
+        key_parts = []
+        # From self attributes
+        key_parts.append(self.model_id) # This is the original model_id passed to __init__
+        key_parts.append(tuple(sorted(self.custom_role_conversions.items())) if self.custom_role_conversions else None)
+
+        # Relevant self.client_kwargs (excluding token)
+        processed_client_kwargs = {k: v for k, v in self.client_kwargs.items() if k != 'token'}
+        key_parts.append(tuple(sorted(processed_client_kwargs.items())))
+
+        # Relevant self.kwargs (init-time settings from ApiModel's perspective)
+        relevant_self_super_kwargs = {}
+        for k, v in self.kwargs.items(): # These are kwargs passed to super().__init__
+            if k in ['temperature', 'max_tokens', 'top_p']: # Add others if InferenceClient takes them at init
+                if isinstance(v, list): v = tuple(v)
+                elif isinstance(v, dict): v = tuple(sorted(v.items()))
+                relevant_self_super_kwargs[k] = v
+        key_parts.append(tuple(sorted(relevant_self_super_kwargs.items())))
+
+        # Process messages (standardized part)
+        processed_messages = []
+        for msg in messages:
+            role = msg.get('role')
+            content = msg.get('content')
+            processed_content_item = None
+            if isinstance(content, list):
+                processed_list_content = []
+                for item in content:
+                    if isinstance(item, dict): processed_list_content.append(tuple(sorted(item.items())))
+                    else: processed_list_content.append(item)
+                processed_content_item = tuple(processed_list_content)
+            elif isinstance(content, dict): processed_content_item = tuple(sorted(content.items()))
+            else: processed_content_item = content
+
+            tool_calls = msg.get('tool_calls')
+            processed_tool_calls = None
+            if isinstance(tool_calls, list):
+                processed_tc_list = []
+                for tc in tool_calls:
+                    if isinstance(tc, dict):
+                        func = tc.get('function', {})
+                        args = func.get('arguments')
+                        if isinstance(args, dict): args = tuple(sorted(args.items()))
+                        elif isinstance(args, list): args = tuple(args)
+                        processed_tc_list.append((tc.get('id'), tc.get('type'), (func.get('name'), args)))
+                    else: processed_tc_list.append(tc)
+                processed_tool_calls = tuple(processed_tc_list)
+            processed_messages.append((role, processed_content_item, processed_tool_calls))
+        key_parts.append(tuple(processed_messages))
+
+        # From __call__ named arguments
+        key_parts.append(tuple(stop_sequences) if stop_sequences else None)
+        key_parts.append(grammar)
+        if tools_to_call_from:
+            processed_tools = []
+            for tool in tools_to_call_from:
+                if hasattr(tool, 'name') and hasattr(tool, 'description') and hasattr(tool, 'inputs'):
+                    processed_tools.append((tool.name, tool.description, tuple(sorted(tool.inputs.items()))))
+                else: processed_tools.append(str(tool))
+            key_parts.append(tuple(processed_tools))
+        else:
+            key_parts.append(None)
+
+        # From __call__ **kwargs_call
+        # These are additional params passed directly to client.chat_completion
+        relevant_call_kwargs = {}
+        for k, v in kwargs_call.items():
+            # Check against typical chat_completion params for InferenceClient
+            if k in ['max_tokens', 'temperature', 'top_p', 'top_k', 'repetition_penalty', 'seed', 'details', 'stream', 'watermark']:
+                if isinstance(v, list): v = tuple(v)
+                elif isinstance(v, dict): v = tuple(sorted(v.items()))
+                relevant_call_kwargs[k] = v
+        key_parts.append(tuple(sorted(relevant_call_kwargs.items())))
+
+        return tuple(key_parts)
 
     def create_client(self):
         """Create the Hugging Face client."""
@@ -1079,7 +1191,8 @@ class InferenceClientModel(ApiModel):
 
         return InferenceClient(**self.client_kwargs)
 
-    def __call__(
+    @cached(cache=lambda self: self._llm_cache, key=lambda self, messages, stop_sequences=None, grammar=None, tools_to_call_from=None, **kwargs_call: self._generate_llm_cache_key_for_inference_client(messages, stop_sequences, grammar, tools_to_call_from, **kwargs_call))
+    async def __call__(
         self,
         messages: List[Dict[str, str]],
         stop_sequences: Optional[List[str]] = None,
@@ -1096,7 +1209,11 @@ class InferenceClientModel(ApiModel):
             custom_role_conversions=self.custom_role_conversions,
             **kwargs,
         )
-        response = self.client.chat_completion(**completion_kwargs)
+            response = self.client.chat_completion(**completion_kwargs)
+        finally:
+            if was_miss:
+                duration = time.time() - start_time
+                logger.debug(f"LLM API call for {self.model_id} (InferenceClientModel) took {duration:.2f}s")
 
         self.last_input_token_count = response.usage.prompt_tokens
         self.last_output_token_count = response.usage.completion_tokens
@@ -1152,17 +1269,107 @@ class OpenAIServerModel(ApiModel):
     ):
         self.client_kwargs = {
             **(client_kwargs or {}),
-            "api_key": api_key,
+            "api_key": api_key, # Will be omitted from cache key
             "base_url": api_base,
             "organization": organization,
             "project": project,
+            # Azure specific like 'api_version', 'azure_endpoint' will be in client_kwargs if passed by AzureOpenAIServerModel
         }
+        # Initialize cache based on global config
+        self._llm_cache_enabled = config.llm_caching_enabled
+        cache_maxsize = config.llm_cache_maxsize if self._llm_cache_enabled else 0
+        self._llm_cache = LRUCache(maxsize=cache_maxsize)
         super().__init__(
             model_id=model_id,
             custom_role_conversions=custom_role_conversions,
             flatten_messages_as_text=flatten_messages_as_text,
             **kwargs,
         )
+
+    def _generate_llm_cache_key_for_openai_server(
+        self,
+        messages: List[Dict[str, Any]],
+        stop_sequences: Optional[List[str]] = None,
+        grammar: Optional[str] = None,
+        tools_to_call_from: Optional[List[Any]] = None,
+        **kwargs_call: Any
+    ) -> Tuple[Any, ...]:
+        key_parts = []
+        # From self attributes
+        key_parts.append(self.model_id)
+        key_parts.append(tuple(sorted(self.custom_role_conversions.items())) if self.custom_role_conversions else None)
+        key_parts.append(self.flatten_messages_as_text)
+
+        # Relevant self.client_kwargs (excluding api_key)
+        # This will include base_url, organization, project, and for Azure: api_version, azure_endpoint
+        processed_client_kwargs = {k: v for k, v in self.client_kwargs.items() if k != 'api_key'}
+        key_parts.append(tuple(sorted(processed_client_kwargs.items())))
+
+        # Relevant self.kwargs (init-time "super" kwargs for Model class)
+        relevant_self_super_kwargs = {}
+        for k, v in self.kwargs.items(): # kwargs passed to Model.__init__
+            if k in ['temperature', 'max_tokens', 'top_p']: # General LLM params often in base kwargs
+                if isinstance(v, list): v = tuple(v)
+                elif isinstance(v, dict): v = tuple(sorted(v.items()))
+                relevant_self_super_kwargs[k] = v
+        key_parts.append(tuple(sorted(relevant_self_super_kwargs.items())))
+
+        # Process messages (standardized part)
+        processed_messages = []
+        for msg in messages:
+            role = msg.get('role')
+            content = msg.get('content')
+            processed_content_item = None
+            if isinstance(content, list):
+                processed_list_content = []
+                for item in content:
+                    if isinstance(item, dict): processed_list_content.append(tuple(sorted(item.items())))
+                    else: processed_list_content.append(item)
+                processed_content_item = tuple(processed_list_content)
+            elif isinstance(content, dict): processed_content_item = tuple(sorted(content.items()))
+            else: processed_content_item = content
+
+            tool_calls = msg.get('tool_calls')
+            processed_tool_calls = None
+            if isinstance(tool_calls, list):
+                processed_tc_list = []
+                for tc in tool_calls:
+                    if isinstance(tc, dict):
+                        func = tc.get('function', {})
+                        args = func.get('arguments')
+                        if isinstance(args, dict): args = tuple(sorted(args.items()))
+                        elif isinstance(args, list): args = tuple(args)
+                        processed_tc_list.append((tc.get('id'), tc.get('type'), (func.get('name'), args)))
+                    else: processed_tc_list.append(tc)
+                processed_tool_calls = tuple(processed_tc_list)
+            processed_messages.append((role, processed_content_item, processed_tool_calls))
+        key_parts.append(tuple(processed_messages))
+
+        # From __call__ named arguments
+        key_parts.append(tuple(stop_sequences) if stop_sequences else None)
+        key_parts.append(grammar)
+        if tools_to_call_from:
+            processed_tools = []
+            for tool in tools_to_call_from: # Assuming get_tool_json_schema output is part of messages or handled by API
+                if hasattr(tool, 'name') and hasattr(tool, 'description') and hasattr(tool, 'inputs'):
+                    processed_tools.append((tool.name, tool.description, tuple(sorted(tool.inputs.items()))))
+                else: processed_tools.append(str(tool))
+            key_parts.append(tuple(processed_tools))
+        else:
+            key_parts.append(None)
+
+        # From __call__ **kwargs_call
+        # These are additional params passed to client.chat.completions.create()
+        relevant_call_kwargs = {}
+        for k, v in kwargs_call.items():
+            # Check against typical OpenAI/Azure params: temperature, max_tokens, top_p, model (override), etc.
+            if k in ['model', 'temperature', 'max_tokens', 'top_p', 'frequency_penalty', 'presence_penalty', 'seed', 'stream', 'timeout', 'user', 'response_format']:
+                if isinstance(v, list): v = tuple(v)
+                elif isinstance(v, dict): v = tuple(sorted(v.items()))
+                relevant_call_kwargs[k] = v
+        key_parts.append(tuple(sorted(relevant_call_kwargs.items())))
+
+        return tuple(key_parts)
 
     def create_client(self):
         try:
@@ -1174,7 +1381,8 @@ class OpenAIServerModel(ApiModel):
 
         return openai.OpenAI(**self.client_kwargs)
 
-    def __call__(
+    @cached(cache=lambda self: self._llm_cache, key=lambda self, messages, stop_sequences=None, grammar=None, tools_to_call_from=None, **kwargs_call: self._generate_llm_cache_key_for_openai_server(messages, stop_sequences, grammar, tools_to_call_from, **kwargs_call))
+    async def __call__(
         self,
         messages: List[Dict[str, str]],
         stop_sequences: Optional[List[str]] = None,
@@ -1182,9 +1390,23 @@ class OpenAIServerModel(ApiModel):
         tools_to_call_from: Optional[List[Any]] = None,
         **kwargs,
     ) -> ChatMessage:
-        completion_kwargs = self._prepare_completion_kwargs(
-            messages=messages,
-            stop_sequences=stop_sequences,
+        kwargs_for_key_func = {"stop_sequences": stop_sequences, "grammar": grammar, "tools_to_call_from": tools_to_call_from, **kwargs}
+        was_miss = False
+        if self._llm_cache_enabled:
+            log_cache_key = self._generate_llm_cache_key_for_openai_server(messages, stop_sequences, grammar, tools_to_call_from, **kwargs)
+            if self._llm_cache.get(log_cache_key, "CACHE_MISS_SENTINEL") != "CACHE_MISS_SENTINEL":
+                logger.debug(f"LLM call CACHE HIT for {self.model_id} (key: {str(log_cache_key)[:100]}...)")
+            else:
+                logger.debug(f"LLM call CACHE MISS for {self.model_id} (key: {str(log_cache_key)[:100]}...)")
+                was_miss = True
+        else:
+            was_miss = True
+
+        start_time = time.time()
+        try:
+            completion_kwargs = self._prepare_completion_kwargs(
+                messages=messages,
+                stop_sequences=stop_sequences,
             grammar=grammar,
             tools_to_call_from=tools_to_call_from,
             model=self.model_id,
@@ -1192,7 +1414,12 @@ class OpenAIServerModel(ApiModel):
             convert_images_to_image_urls=True,
             **kwargs,
         )
-        response = self.client.chat.completions.create(**completion_kwargs)
+            response = self.client.chat.completions.create(**completion_kwargs)
+        finally:
+            if was_miss:
+                duration = time.time() - start_time
+                logger.debug(f"LLM API call for {self.model_id} (OpenAIServerModel) took {duration:.2f}s")
+
         self.last_input_token_count = response.usage.prompt_tokens
         self.last_output_token_count = response.usage.completion_tokens
 
@@ -1342,6 +1569,10 @@ class AmazonBedrockServerModel(ApiModel):
             MessageRole.TOOL_RESPONSE: MessageRole.USER,
         }
 
+        # Initialize cache based on global config
+        self._llm_cache_enabled = config.llm_caching_enabled
+        cache_maxsize = config.llm_cache_maxsize if self._llm_cache_enabled else 0
+        self._llm_cache = LRUCache(maxsize=cache_maxsize)
         super().__init__(
             model_id=model_id,
             custom_role_conversions=custom_role_conversions,
@@ -1349,6 +1580,89 @@ class AmazonBedrockServerModel(ApiModel):
             client=client,
             **kwargs,
         )
+
+    def _generate_llm_cache_key_for_bedrock(
+        self,
+        messages: List[Dict[str, Any]],
+        tools_to_call_from: Optional[List[Any]] = None,
+        **kwargs_call: Any
+    ) -> Tuple[Any, ...]:
+        key_parts = []
+        # From self attributes
+        key_parts.append(self.model_id)
+        key_parts.append(tuple(sorted(self.custom_role_conversions.items())) if self.custom_role_conversions else None)
+        key_parts.append(self.flatten_messages_as_text) # Should be False for Bedrock
+
+        # Relevant self.client_kwargs (e.g., region_name, endpoint_url for boto3 client)
+        key_parts.append(tuple(sorted(self.client_kwargs.items())))
+
+        # Relevant self.kwargs (init-time kwargs for Bedrock, e.g., inferenceConfig, guardrailConfig)
+        # These are directly passed to self.client.converse()
+        processed_self_kwargs = {}
+        for k, v in self.kwargs.items():
+            # Bedrock specific configs often passed at init
+            if k in ['inferenceConfig', 'guardrailConfig', 'additionalModelRequestFields',
+                       'temperature', 'max_tokens', 'top_p', 'stop_sequences']: # Common params
+                if isinstance(v, dict): v = tuple(sorted(v.items()))
+                elif isinstance(v, list): v = tuple(v)
+                processed_self_kwargs[k] = v
+        key_parts.append(tuple(sorted(processed_self_kwargs.items())))
+
+        # Process messages (standardized part, Bedrock _prepare removes 'type' later, key on original)
+        processed_messages = []
+        for msg in messages:
+            role = msg.get('role')
+            content = msg.get('content')
+            processed_content_item = None
+            if isinstance(content, list): # Bedrock content is usually list of dicts
+                processed_list_content = []
+                for item in content: # item is dict like {'text': '...'} or {'image': ...}
+                    if isinstance(item, dict): processed_list_content.append(tuple(sorted(item.items())))
+                    else: processed_list_content.append(item) # Should not happen for Bedrock content structure
+                processed_content_item = tuple(processed_list_content)
+            # Bedrock doesn't typically have str content directly, but good to be safe
+            elif isinstance(content, dict): processed_content_item = tuple(sorted(content.items()))
+            else: processed_content_item = content
+
+            tool_calls = msg.get('tool_calls') # Unlikely in input to Bedrock, but for completeness
+            processed_tool_calls = None
+            if isinstance(tool_calls, list):
+                processed_tc_list = []
+                for tc in tool_calls:
+                    if isinstance(tc, dict):
+                        func = tc.get('function', {})
+                        args = func.get('arguments')
+                        if isinstance(args, dict): args = tuple(sorted(args.items()))
+                        elif isinstance(args, list): args = tuple(args)
+                        processed_tc_list.append((tc.get('id'), tc.get('type'), (func.get('name'), args)))
+                    else: processed_tc_list.append(tc)
+                processed_tool_calls = tuple(processed_tc_list)
+            processed_messages.append((role, processed_content_item, processed_tool_calls))
+        key_parts.append(tuple(processed_messages))
+
+        # From __call__ named argument tools_to_call_from
+        if tools_to_call_from:
+            processed_tools = []
+            for tool in tools_to_call_from:
+                if hasattr(tool, 'name') and hasattr(tool, 'description') and hasattr(tool, 'inputs'):
+                    processed_tools.append((tool.name, tool.description, tuple(sorted(tool.inputs.items()))))
+                else: processed_tools.append(str(tool))
+            key_parts.append(tuple(processed_tools))
+        else:
+            key_parts.append(None)
+
+        # From __call__ **kwargs_call (these are additional args to _prepare_completion_kwargs)
+        # For Bedrock, these might override parts of self.kwargs or add new ones.
+        relevant_call_kwargs = {}
+        for k, v in kwargs_call.items():
+            if k in ['inferenceConfig', 'guardrailConfig', 'additionalModelRequestFields',
+                       'temperature', 'max_tokens', 'top_p', 'stop_sequences']: # Bedrock specific or common overrides
+                if isinstance(v, dict): v = tuple(sorted(v.items()))
+                elif isinstance(v, list): v = tuple(v)
+                relevant_call_kwargs[k] = v
+        key_parts.append(tuple(sorted(relevant_call_kwargs.items())))
+
+        return tuple(key_parts)
 
     def _prepare_completion_kwargs(
         self,
@@ -1403,24 +1717,40 @@ class AmazonBedrockServerModel(ApiModel):
 
         return boto3.client("bedrock-runtime", **self.client_kwargs)
 
-    def __call__(
+    @cached(cache=lambda self: self._llm_cache, key=lambda self, messages, tools_to_call_from=None, **kwargs_call: self._generate_llm_cache_key_for_bedrock(messages, tools_to_call_from, **kwargs_call))
+    async def __call__(
         self,
         messages: List[Dict[str, str]],
         tools_to_call_from: Optional[List[Any]] = None,
         **kwargs,
     ) -> ChatMessage:
-        completion_kwargs: Dict = self._prepare_completion_kwargs(
-            messages=messages,
-            tools_to_call_from=tools_to_call_from,
-            custom_role_conversions=self.custom_role_conversions,
-            convert_images_to_image_urls=True,
-            **kwargs,
-        )
+        kwargs_for_key_func = {"tools_to_call_from": tools_to_call_from, **kwargs}
+        was_miss = False
+        if self._llm_cache_enabled:
+            log_cache_key = self._generate_llm_cache_key_for_bedrock(messages, tools_to_call_from, **kwargs)
+            if self._llm_cache.get(log_cache_key, "CACHE_MISS_SENTINEL") != "CACHE_MISS_SENTINEL":
+                logger.debug(f"LLM call CACHE HIT for {self.model_id} (key: {str(log_cache_key)[:100]}...)")
+            else:
+                logger.debug(f"LLM call CACHE MISS for {self.model_id} (key: {str(log_cache_key)[:100]}...)")
+                was_miss = True
+        else:
+            was_miss = True
 
-        # self.client is created in ApiModel class
-        response = self.client.converse(**completion_kwargs)
+        start_time = time.time()
+        try:
+            completion_kwargs: Dict = self._prepare_completion_kwargs(
+                messages=messages,
+                tools_to_call_from=tools_to_call_from,
+                custom_role_conversions=self.custom_role_conversions,
+                convert_images_to_image_urls=True,
+                **kwargs,
+            )
+            response = self.client.converse(**completion_kwargs)
+        finally:
+            if was_miss:
+                duration = time.time() - start_time
+                logger.debug(f"LLM API call for {self.model_id} (AmazonBedrockServerModel) took {duration:.2f}s")
 
-        # Get usage
         self.last_input_token_count = response["usage"]["inputTokens"]
         self.last_output_token_count = response["usage"]["outputTokens"]
 

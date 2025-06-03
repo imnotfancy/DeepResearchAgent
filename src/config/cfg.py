@@ -127,21 +127,29 @@ class Config(BaseModel):
     
     # Dataset Config
     dataset: DatasetConfig = Field(default_factory=DatasetConfig)
+
+    # Cache Config
+    llm_caching_enabled: bool = Field(default=True, description="Enable or disable LLM call caching.")
+    llm_cache_maxsize: int = Field(default=128, description="Maximum size for the LLM call LRU cache.")
     
     def init_config(self, config_path: "config.toml"):
         
         with open(config_path, "r") as f:
-            config = toml.load(f)
+            loaded_config = toml.load(f) # Renamed to avoid conflict with global 'config'
             
         # General Config
-        self.workdir = config["workdir"]
-        self.tag = config["tag"]
-        self.concurrency = config["concurrency"]
-        self.log_path = config["log_path"]
-        self.download_path = config["download_path"]
-        self.use_local_proxy = config["use_local_proxy"]
-        self.split = config["split"]
-        self.save_path = config["save_path"]
+        self.workdir = loaded_config["workdir"]
+        self.tag = loaded_config["tag"]
+        self.concurrency = loaded_config["concurrency"]
+        self.log_path = loaded_config["log_path"]
+        self.download_path = loaded_config["download_path"]
+        self.use_local_proxy = loaded_config["use_local_proxy"]
+        self.split = loaded_config["split"]
+        self.save_path = loaded_config["save_path"]
+
+        # Cache Config - Initialize from loaded_config or use defaults
+        self.llm_caching_enabled = loaded_config.get("llm_caching_enabled", self.llm_caching_enabled)
+        self.llm_cache_maxsize = loaded_config.get("llm_cache_maxsize", self.llm_cache_maxsize)
         
         # Create Workdir
         self.workdir = assemble_project_path(os.path.join('workdir', self.tag))
@@ -152,23 +160,23 @@ class Config(BaseModel):
         self.save_path = os.path.join(self.workdir, self.save_path)
             
         # Tool Config
-        self.searcher_tool = SearcherToolConfig(**config["searcher_tool"])
-        self.deep_researcher_tool = DeepResearcherToolConfig(**config["deep_researcher_tool"])
-        self.browser_tool = BrowserToolConfig(**config["browser_tool"])
-        self.deep_analyzer_tool = DeepAnalyzerToolConfig(**config["deep_analyzer_tool"])
+        self.searcher_tool = SearcherToolConfig(**loaded_config["searcher_tool"])
+        self.deep_researcher_tool = DeepResearcherToolConfig(**loaded_config["deep_researcher_tool"])
+        self.browser_tool = BrowserToolConfig(**loaded_config["browser_tool"])
+        self.deep_analyzer_tool = DeepAnalyzerToolConfig(**loaded_config["deep_analyzer_tool"])
 
         # Agent Config
-        planning_agent_config = AgentConfig(**config["agent"]["planning_agent_config"])
-        planning_agent_config.template_path = assemble_project_path(config["agent"]["planning_agent_config"]["template_path"])
-        deep_analyzer_agent_config = AgentConfig(**config["agent"]["deep_analyzer_agent_config"])
-        deep_analyzer_agent_config.template_path = assemble_project_path(config["agent"]["deep_analyzer_agent_config"]["template_path"])
-        browser_use_agent_config = AgentConfig(**config["agent"]["browser_use_agent_config"])
-        browser_use_agent_config.template_path = assemble_project_path(config["agent"]["browser_use_agent_config"]["template_path"])
-        deep_researcher_agent_config = AgentConfig(**config["agent"]["deep_researcher_agent_config"])
-        deep_researcher_agent_config.template_path = assemble_project_path(config["agent"]["deep_researcher_agent_config"]["template_path"])
+        planning_agent_config = AgentConfig(**loaded_config["agent"]["planning_agent_config"])
+        planning_agent_config.template_path = assemble_project_path(loaded_config["agent"]["planning_agent_config"]["template_path"])
+        deep_analyzer_agent_config = AgentConfig(**loaded_config["agent"]["deep_analyzer_agent_config"])
+        deep_analyzer_agent_config.template_path = assemble_project_path(loaded_config["agent"]["deep_analyzer_agent_config"]["template_path"])
+        browser_use_agent_config = AgentConfig(**loaded_config["agent"]["browser_use_agent_config"])
+        browser_use_agent_config.template_path = assemble_project_path(loaded_config["agent"]["browser_use_agent_config"]["template_path"])
+        deep_researcher_agent_config = AgentConfig(**loaded_config["agent"]["deep_researcher_agent_config"])
+        deep_researcher_agent_config.template_path = assemble_project_path(loaded_config["agent"]["deep_researcher_agent_config"]["template_path"])
         self.agent = HierarchicalAgentConfig(
-            name=config["agent"]["name"],
-            use_hierarchical_agent=config["agent"]["use_hierarchical_agent"],
+            name=loaded_config["agent"]["name"],
+            use_hierarchical_agent=loaded_config["agent"]["use_hierarchical_agent"],
             planning_agent_config=planning_agent_config,
             deep_analyzer_agent_config=deep_analyzer_agent_config,
             browser_use_agent_config=browser_use_agent_config,
@@ -176,7 +184,7 @@ class Config(BaseModel):
         ) 
         
         # Dataset Config
-        self.dataset = DatasetConfig(**config["dataset"])
+        self.dataset = DatasetConfig(**loaded_config["dataset"])
         
     def __str__(self):
         return self.model_dump_json(indent=4)
