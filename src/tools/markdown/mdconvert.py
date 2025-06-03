@@ -31,13 +31,17 @@ def read_tables_from_stream(file_stream):
 
 def transcribe_audio(file_stream, audio_format):
     proxy_url = os.getenv("SKYWORK_WHISPER_BJ_API_BASE", None)
-    if proxy_url is not None:
+    allowed_urls = ["https://trusted-api.example.com", "https://another-trusted-api.example.com"]
+    if proxy_url is not None and proxy_url in allowed_urls:
         with proxy_env(proxy_url):
             files = {'file': file_stream}
             headers = {
                 "app_key": os.getenv("SKYWORK_API_KEY"),
             }
             response = requests.post(proxy_url, headers=headers, files=files)
+    else:
+        logger.error(f"Invalid proxy URL: {proxy_url}")
+        raise ValueError("Untrusted proxy URL provided.")
     else:
         response = transcription(model="gpt-4o-transcribe", file=file_stream)
 
