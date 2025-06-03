@@ -31,7 +31,7 @@ max_follow_ups = 3
 [browser_tool]
 model_id = "gpt-4.1"
 headless = false
-disable_security = true
+disable_security = false
 extra_chromium_args = []
 chrome_instance_path = ""
 wss_url = ""

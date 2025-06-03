@@ -209,7 +209,7 @@ class BrowserUseTool(AsyncTool, Generic[Context]):
     async def _ensure_browser_initialized(self) -> BrowserContext:
         """Ensure browser and context are initialized."""
         if self.browser is None:
-            browser_config_kwargs = {"headless": False, "disable_security": True}
+            browser_config_kwargs = {"headless": False, "disable_security": False}
 
             if self.browser_config:
                 from browser_use.browser.browser import ProxySettings
