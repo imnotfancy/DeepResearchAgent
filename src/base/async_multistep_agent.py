@@ -23,20 +23,22 @@ from rich.text import Text
 if TYPE_CHECKING:
     import PIL.Image
 
+from dataclasses import dataclass # Import dataclass
 from src.tools.default_tools import TOOL_MAPPING
 from src.tools.final_answer import FinalAnswerTool
 from src.tools.executor.local_python_executor import BASE_BUILTIN_MODULES
-from src.memory import (ActionStep,
-                        AgentMemory,
-                        FinalAnswerStep,
-                        PlanningStep,
-                        SystemPromptStep,
-                        UserPromptStep,
-                        TaskStep,
-                        Message)
+from src.memory import (ActionStep, # Already here
+                        AgentMemory, # Already here
+                        FinalAnswerStep, # Already here
+                        PlanningStep, # Already here
+                        SystemPromptStep, # Already here
+                        UserPromptStep, # Already here
+                        TaskStep, # Already here
+                        Message, # Already here
+                        ToolCall) # Import ToolCall from src.memory
 from src.models import (
-    ChatMessage,
-    MessageRole,
+    ChatMessage, # Already here
+    MessageRole, # Already here
     Model
 )
 from src.logger import (
@@ -51,18 +53,42 @@ from src.exception import (
     AgentGenerationError,
     AgentMaxStepsError,
     AgentParsingError,
-
+    AgentToolCallError, # Import AgentToolCallError
+    AgentToolExecutionError, # Import AgentToolExecutionError
 )
 
 from src.utils import (
     is_valid_name,
     make_init_file,
     truncate_content,
+    # parse_json_if_needed # This will be defined locally for now
 )
 
 from src.logger import logger
-from src.config import config
+# from src.config import config # Config is now passed in __init__
 
+# ToolCall is now imported from src.memory
+# Keep parse_json_if_needed here for now
+def parse_json_if_needed(text: str) -> Any:
+    """
+    Tries to parse the text as JSON. If successful, returns the parsed object.
+    If the text is not valid JSON or another error occurs, returns the original text.
+    Handles cases where the text might be a JSON string within a larger string (e.g. ```json...```)
+    """
+    # Strip common code block markers
+    text = text.strip()
+    if text.startswith("```json"):
+        text = text[7:]
+    if text.startswith("```"):
+        text = text[3:]
+    if text.endswith("```"):
+        text = text[:-3]
+    text = text.strip()
+
+    try:
+        return json5.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return text # Return original text if not valid JSON or not a string/bytes
 
 def get_variable_names(self, template: str) -> Set[str]:
     pattern = re.compile(r"\{\{([^{}]+)\}\}")
@@ -180,6 +206,7 @@ class AsyncMultiStepAgent(ABC):
         self,
         tools: list[AsyncTool],
         model: Model,
+        config: Any, # TODO: Add type hint for config
         prompt_templates: PromptTemplates | None = None,
         max_steps: int = 20,
         add_base_tools: bool = False,
@@ -195,16 +222,28 @@ class AsyncMultiStepAgent(ABC):
     ):
         self.agent_name = self.__class__.__name__
         self.model = model
-        self.prompt_templates = prompt_templates or EMPTY_PROMPT_TEMPLATES
+        self.config = config
+
         if prompt_templates is not None:
-            missing_keys = set(EMPTY_PROMPT_TEMPLATES.keys()) - set(prompt_templates.keys())
+            self.prompt_templates = prompt_templates
+        elif self.config and hasattr(self.config, "template_path"):
+            # Load prompt templates from config template_path
+            project_root = Path(__file__).resolve().parents[2]
+            full_template_path = project_root / self.config.template_path
+            with open(full_template_path, "r") as f:
+                self.prompt_templates = yaml.safe_load(f)
+        else:
+            self.prompt_templates = EMPTY_PROMPT_TEMPLATES
+
+        if self.prompt_templates is not None and self.prompt_templates is not EMPTY_PROMPT_TEMPLATES :
+            missing_keys = set(EMPTY_PROMPT_TEMPLATES.keys()) - set(self.prompt_templates.keys())
             assert not missing_keys, (
                 f"Some prompt templates are missing from your custom `prompt_templates`: {missing_keys}"
             )
             for key, value in EMPTY_PROMPT_TEMPLATES.items():
                 if isinstance(value, dict):
                     for subkey in value.keys():
-                        assert key in prompt_templates.keys() and (subkey in prompt_templates[key].keys()), (
+                        assert key in self.prompt_templates.keys() and (subkey in self.prompt_templates[key].keys()), (
                             f"Some prompt templates are missing from your custom `prompt_templates`: {subkey} under {key}"
                         )
 
@@ -219,14 +258,14 @@ class AsyncMultiStepAgent(ABC):
         self.final_answer_checks = final_answer_checks
 
         self._setup_managed_agents(managed_agents)
-        self._setup_tools(tools, add_base_tools)
+        self._setup_tools(tools, add_base_tools) # self.tools is initialized here
         self._validate_tools_and_managed_agents(tools, managed_agents)
+
+        self.task: str | None = None # self.task is initialized before calling initialize_task_instruction
 
         self.system_prompt = self.initialize_system_prompt()
         self.user_prompt = self.initialize_user_prompt()
-        
-        self.task: str | None = None
-        self.memory = AgentMemory(self.system_prompt, self.user_prompt)
+        self.memory = AgentMemory(system_prompt=self.system_prompt, user_prompt=self.user_prompt)
 
         self.logger = logger
 
@@ -494,21 +533,127 @@ You have been provided with these additional arguments, that you can access usin
         )
         return [self.memory.system_prompt] + self.memory.steps
 
-    @abstractmethod
     def initialize_system_prompt(self) -> str:
-        """To be implemented in child classes"""
-        ...
-        
-    @abstractmethod
+        """Initializes the system prompt using the prompt_templates."""
+        return populate_template(
+            self.prompt_templates["system_prompt"],
+            variables={
+                "tools": self.tools,
+                "managed_agents": self.managed_agents,
+            },
+        )
+
     def initialize_user_prompt(self) -> str:
-        """To be implemented in child classes"""
-        ...
-    
-    @abstractmethod
+        """Initializes the user prompt using the prompt_templates."""
+        return populate_template(
+            self.prompt_templates["user_prompt"],
+            variables={
+                "task": self.task,
+                "tools": self.tools,
+                "managed_agents": self.managed_agents,
+            },
+        )
+
     def initialize_task_instruction(self) -> str:
-        """To be implemented in child classes"""
-        ...
-    
+        """Initializes the task instruction using the prompt_templates."""
+        # Ensure self.task is the raw task string before populating
+        if not self.task:
+            raise ValueError("Task must be set before initializing task instruction.")
+        return populate_template(
+            self.prompt_templates["task_instruction"],
+            variables={"task": self.task},
+        )
+
+    def _substitute_state_variables(self, text: str) -> str:
+        """Substitutes state variables in the given text.
+        Example: "Hello {{name}}" with state {"name": "World"} -> "Hello World"
+        """
+        if not isinstance(text, str):
+            return text
+
+        # Find all placeholders like {{variable_name}}
+        placeholders = re.findall(r"\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}", text)
+
+        substituted_text = text
+        for placeholder in placeholders:
+            if placeholder in self.state:
+                substituted_text = substituted_text.replace(f"{{{{{placeholder}}}}}", str(self.state[placeholder]))
+            else:
+                self.logger.log(f"Warning: Variable '{placeholder}' not found in agent state.", LogLevel.WARNING)
+        return substituted_text
+
+    async def execute_tool_call(self, tool_call: "ToolCall") -> Any:
+        """Executes a tool call and returns the output.
+
+        Args:
+            tool_call (ToolCall): The tool call to execute.
+
+        Returns:
+            Any: The output of the tool.
+        """
+        tool_name = tool_call.name # Use tool_call.name
+        tool_arguments = tool_call.arguments # Use tool_call.arguments
+
+        # Substitute state variables in tool arguments
+        if isinstance(tool_arguments, str):
+            tool_arguments = self._substitute_state_variables(tool_arguments)
+        elif isinstance(tool_arguments, dict):
+            tool_arguments = {
+                k: self._substitute_state_variables(v) if isinstance(v, str) else v
+                for k, v in tool_arguments.items()
+            }
+
+        if tool_name in self.tools:
+            tool = self.tools[tool_name]
+            try:
+                # Log the tool call before execution
+                self.logger.log(
+                    f"Calling tool {tool_name} with parameters: {tool_arguments}",
+                    level=LogLevel.INFO,
+                    color="yellow"
+                )
+                tool_output = await tool.run(tool_arguments, agent=self) # Pass agent instance
+                # Log the tool output after execution
+                self.logger.log(
+                    f"Tool {tool_name} output: {tool_output}",
+                    level=LogLevel.INFO,
+                    color="yellow"
+                )
+                return tool_output
+            except Exception as e:
+                error_message = f"Error executing tool {tool_name}: {e}"
+                self.logger.log(error_message, LogLevel.ERROR, color="red")
+                raise AgentToolExecutionError(error_message, self.logger) from e
+        elif tool_name in self.managed_agents:
+            managed_agent = self.managed_agents[tool_name]
+            try:
+                # Log the managed agent call before execution
+                self.logger.log(
+                    f"Calling managed agent {tool_name} with task: {tool_arguments}",
+                    level=LogLevel.INFO,
+                    color="yellow"
+                )
+                # Ensure tool_arguments is a string (task for the managed agent)
+                if not isinstance(tool_arguments, str):
+                    tool_arguments = str(tool_arguments)
+
+                agent_output = await managed_agent(task=tool_arguments) # Pass task to managed_agent
+                # Log the managed agent output after execution
+                self.logger.log(
+                    f"Managed agent {tool_name} output: {agent_output}",
+                    level=LogLevel.INFO,
+                    color="yellow"
+                )
+                return agent_output
+            except Exception as e:
+                error_message = f"Error executing managed agent {tool_name}: {e}"
+                self.logger.log(error_message, LogLevel.ERROR, color="red")
+                raise AgentToolExecutionError(error_message, self.logger) from e
+        else:
+            error_message = f"Tool or managed agent '{tool_name}' not found."
+            self.logger.log(error_message, LogLevel.ERROR, color="red")
+            raise AgentToolCallError(error_message, self.logger)
+
     def interrupt(self):
         """Interrupts the agent execution."""
         self.interrupt_switch = True
@@ -599,8 +744,156 @@ You have been provided with these additional arguments, that you can access usin
 
     @abstractmethod
     async def step(self, memory_step: ActionStep) -> None | Any:
-        """To be implemented in children classes. Should return either None if the step is not final."""
-        pass
+        """Executes a single step of the agent's thought-action-observation loop.
+
+        Args:
+            memory_step (ActionStep): The memory step to record the action and observation.
+
+        Returns:
+            None | Any: The final answer if the agent decides to stop, otherwise None.
+        """
+        try:
+            # 1. Generate action from the model
+            messages = await self.write_memory_to_messages()
+            # Add any images to the last message if available in the current memory_step
+            if memory_step.observations_images:
+                if messages and messages[-1]["role"] == MessageRole.USER: # Add to last user message
+                    if isinstance(messages[-1]["content"], str): # if content is string, convert to list
+                         messages[-1]["content"] = [{"type": "text", "text": messages[-1]["content"]}]
+                    messages[-1]["content"].extend([{"type": "image"} for _ in memory_step.observations_images])
+                else: # Or create a new user message for images
+                    messages.append(ChatMessage(role=MessageRole.USER, content=[{"type": "image"} for _ in memory_step.observations_images]))
+
+            model_output: ChatMessage = self.model(
+                messages,
+                images=memory_step.observations_images, # Pass images to the model
+                grammar=self.grammar, # Pass grammar if any
+            )
+            memory_step.model_input_messages = messages
+            memory_step.model_output_message = model_output
+
+            # TODO: This parsing logic might need to be made abstract or configurable
+            # For now, assuming a simple split logic, but this is a common source of variation.
+            # If your agent uses JSON or XML, you'll need to override this.
+            try:
+                # Attempt to parse JSON if applicable (common for tool use)
+                parsed_output = parse_json_if_needed(model_output.content)
+                # Using src.memory.ToolCall: requires 'name', 'arguments', 'id'. 'rationale' is not part of it.
+                # 'id' will be tricky to generate here if not provided by the model directly in this format.
+                # For now, if the model returns tool_name/tool_params, we adapt.
+                # A more robust solution might involve the model returning a structure closer to src.memory.ToolCall.
+
+                rationale = parsed_output.get("rationale") if isinstance(parsed_output, dict) else None
+                if rationale:
+                    memory_step.rationale = rationale
+
+                if isinstance(parsed_output, dict) and "tool_name" in parsed_output and "tool_params" in parsed_output:
+                     # Create a src.memory.ToolCall object. 'id' might be missing or need a placeholder.
+                     # The model might not provide an 'id' in this custom format.
+                     # This is a gap: src.memory.ToolCall expects an 'id'.
+                     # For now, let's use a placeholder id if not present.
+                     tool_id = parsed_output.get("id", "placeholder_id")
+                     tool_call = ToolCall(name=parsed_output["tool_name"], arguments=parsed_output["tool_params"], id=tool_id)
+                elif isinstance(parsed_output, dict) and "final_answer" in parsed_output: # Check for final answer
+                    final_answer = parsed_output["final_answer"]
+                    memory_step.action_output = final_answer
+                    memory_step.rationale = rationale if rationale else parsed_output.get("rationale", "No rationale provided for final answer.")
+                    self.logger.log_final_answer(final_answer, self.name)
+                    return final_answer
+                else: # Fallback or if no specific parsing needed, treat as simple action.
+                    # This part needs to be robust. What if there's no split token?
+                    # This is a placeholder for more sophisticated action parsing.
+                    # For now, we assume a simple "final_answer" or tool call structure.
+                    # If it's not a structured call, it might be a direct answer or need other parsing.
+                    # This part might need to be made abstract if agents vary too much here.
+                    # For now, if not a tool call, assume it could be a final answer if it's a string.
+                    if isinstance(model_output.content, str) and not self.tools: # No tools, might be direct answer
+                         self.logger.log_final_answer(model_output.content, self.name)
+                         return model_output.content
+                    raise AgentParsingError(f"Could not parse LLM output: {model_output.content}", self.logger)
+
+            except AgentParsingError: # Fallback to simpler split if JSON parsing fails or isn't applicable.
+                 # This is a common pattern: Rationale <split_token> Action
+                 # The split_token should ideally be defined in config or prompts.
+                 # Using a default or expecting it from prompts.
+                 # This part is highly dependent on the expected output format from the LLM.
+                split_token = getattr(self.config, "action_split_token", "Tool Call:") # Example token
+                rationale, action_str = self.extract_action(model_output.content, split_token)
+                memory_step.rationale = rationale
+                # Further parsing of action_str to ToolCall might be needed here.
+                # This is a placeholder and needs to be robust.
+                # Example: tool_name(tool_params_json_string)
+                match = re.match(r"(\w+)\((.*)\)", action_str)
+                if match:
+                    tool_name, tool_params_str = match.groups()
+                    try:
+                        tool_arguments = json5.loads(tool_params_str) # Use json5 for more flexible parsing
+                    except json.JSONDecodeError:
+                        # if params are not json, pass as string
+                        tool_arguments = tool_params_str
+                    # Again, src.memory.ToolCall needs an 'id'.
+                    tool_call = ToolCall(name=tool_name.strip(), arguments=tool_arguments, id="placeholder_id_fallback")
+                else: # If no clear tool call format, could be final answer or error
+                    if "final_answer" in action_str.lower() or not self.tools: # Heuristic for final answer
+                        final_answer_text = action_str.replace("Final Answer:", "").strip()
+                        memory_step.rationale = rationale if rationale else "No rationale provided."
+                        memory_step.action_output = final_answer_text
+                        self.logger.log_final_answer(final_answer_text, self.name)
+                        return final_answer_text
+                    raise AgentParsingError(f"Could not parse action string: {action_str}", self.logger)
+
+            # memory_step.action = tool_call # 'action' field does not exist on ActionStep, tool_calls is used.
+            memory_step.tool_calls = [tool_call] # Store the tool call in the memory step
+
+            # 2. Execute tool call
+            if tool_call.name == "final_answer": # Use tool_call.name
+                # This is often a special tool that signals the end.
+                # The parameters to final_answer usually contain the actual response.
+                final_answer_content = tool_call.arguments.get("answer") if isinstance(tool_call.arguments, dict) else str(tool_call.arguments)
+                if final_answer_content is None:
+                    raise AgentToolExecutionError("final_answer tool called without 'answer' parameter.", self.logger)
+
+                memory_step.action_output = final_answer_content # Keep action_output for final answer
+                self.logger.log_final_answer(final_answer_content, self.name)
+                return final_answer_content
+
+            observation = await self.execute_tool_call(tool_call)
+            memory_step.observation = observation
+            memory_step.action_output = observation # For consistency, action_output can be the observation
+
+            # Store observation in state if tool indicates it (e.g. via a special return or config)
+            # This part is application-specific. Example:
+            # Using tool_call.name and tool_call.arguments
+            if hasattr(self.tools.get(tool_call.name), "store_output_in_state") and self.tools[tool_call.name].store_output_in_state:
+                 if isinstance(observation, dict): # if observation is dict, update state
+                      self.state.update(observation)
+                 elif isinstance(observation, str) and isinstance(tool_call.arguments, dict) and tool_call.arguments.get("variable_name"):
+                      self.state[tool_call.arguments["variable_name"]] = observation
+                 # else, how to name it in state? Maybe tool_name_output?
+                 # self.state[f"{tool_call.name}_output"] = observation
+
+
+        except AgentToolCallError as e: # Tool name validation error
+            memory_step.error = e
+            memory_step.observation = str(e)
+        except AgentToolExecutionError as e: # Tool execution error
+            memory_step.error = e
+            memory_step.observation = str(e)
+        except AgentParsingError as e: # LLM output parsing error
+            memory_step.error = e
+            memory_step.observation = str(e) # Observation can be the error message for the LLM to correct
+        except AgentGenerationError as e: # LLM generation error (e.g. API error)
+            # This is more critical and might indicate issues with the LLM service
+            memory_step.error = e
+            # Unlike other errors, this might not be something the agent can easily recover from by itself.
+            # Depending on severity, might re-raise or try a recovery mechanism.
+            raise # Re-raise for now, as it's a generation infrastructure problem
+        except Exception as e: # Catch any other unexpected error during the step
+            unexpected_error = AgentError(f"Unexpected error during agent step: {e}", self.logger)
+            memory_step.error = unexpected_error
+            memory_step.observation = str(unexpected_error)
+
+        return None # No final answer yet, continue stepping
 
     def replay(self, detailed: bool = False):
         """Prints a pretty replay of the agent's steps.

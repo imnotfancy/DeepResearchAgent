@@ -14,52 +14,49 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import importlib
-import inspect
-import json
-import os
-import re
-import tempfile
-import textwrap
-import time
-from abc import ABC, abstractmethod
-from collections import deque
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, Generator, List, Optional, Set, Tuple, TypedDict, Union
-
-import jinja2
-import yaml
-from huggingface_hub import create_repo, metadata_update, snapshot_download, upload_folder
-from jinja2 import StrictUndefined, Template
-from rich.rule import Rule
-from rich.text import Text
-from rich.panel import Panel
-from rich import box
+# import inspect # Not used
+# import json # Not used after removing execute_tool_call and step
+# import os # Not used
+# import re # Not used
+# import tempfile # Not used
+# import textwrap # Not used
+# import time # Not used
+# from abc import ABC, abstractmethod # Not used
+# from collections import deque # Not used
+# from pathlib import Path # Not used
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional # Union, Tuple, Set, Generator, TypedDict - Not used
+# import jinja2 # Not used
+import yaml # Still used for loading prompt_templates
+# from huggingface_hub import create_repo, metadata_update, snapshot_download, upload_folder # Not used
+# from jinja2 import StrictUndefined, Template # Not used
+# from rich.rule import Rule # Not used
+# from rich.text import Text # Not used
+# from rich.panel import Panel # Not used
+# from rich import box # Not used
 
 
 if TYPE_CHECKING:
-    import PIL.Image
+    import PIL.Image # Keep for type hinting if AsyncMultiStepAgent or its methods use it
 
-from src.memory import (ActionStep,
-                        ToolCall)
-from src.models import (
-    ChatMessage,
-)
+# from src.memory import (ActionStep, ToolCall) # ToolCall is handled by AsyncMultiStepAgent, ActionStep not used
+# from src.models import (ChatMessage) # Not used after removing step
 from src.logger import (
-    LogLevel,
+    LogLevel, # Keep for __init__ type hint
 )
 
-from src.tools import Tool
+from src.tools import Tool # Keep for __init__ type hint
 from src.exception import (
-    AgentParsingError,
-    AgentToolCallError,
-    AgentToolExecutionError,
+    # AgentParsingError, # Not used after removing step
+    AgentToolCallError, # Potentially kept if there are other methods, but likely unused. Removing for now.
+    AgentToolExecutionError, # Potentially kept if there are other methods, but likely unused. Removing for now.
 )
-from src.base.multistep_agent import MultiStepAgent, PromptTemplates, populate_template
-from src.models import Model
+from .async_multistep_agent import AsyncMultiStepAgent, PromptTemplates # PromptTemplates needed for __init__ type hint
+from src.models import Model # Keep for __init__ type hint, removed parse_json_if_needed
+# from src.utils.agent_types import AgentAudio, AgentImage # Not used after removing step
 
-from src.logger import logger, YELLOW_HEX
+from src.logger import logger # Keep logger, remove YELLOW_HEX
 
-class ToolCallingAgent(MultiStepAgent):
+class ToolCallingAgent(AsyncMultiStepAgent): # Changed parent class
     """
     This agent uses JSON-like tool calls, using method `model.get_tool_call` to leverage the LLM engine's tool calling capabilities.
 
@@ -75,195 +72,49 @@ class ToolCallingAgent(MultiStepAgent):
         self,
         tools: list[Tool],
         model: Model,
-        prompt_templates: PromptTemplates | None = None,
-        planning_interval: int | None = None,
-        **kwargs,
+        prompt_templates: Optional[PromptTemplates] = None, # Made Optional explicit
+        planning_interval: Optional[int] = None, # Made Optional explicit
+        **kwargs: Any, # Added type hint for kwargs
     ):
+        # Load prompt_templates from the specific YAML file for ToolCallingAgent
         prompt_templates = prompt_templates or yaml.safe_load(
             importlib.resources.files("src.base.prompts").joinpath("toolcalling_agent.yaml").read_text()
         )
+
+        # Extract relevant parameters from kwargs for AsyncMultiStepAgent's __init__
+        max_steps = kwargs.pop("max_steps", 20)
+        add_base_tools = kwargs.pop("add_base_tools", False)
+        # Ensure verbosity_level uses self.logger.level if available from a previous init step,
+        # or a kwarg, or a default. Here, ToolCallingAgent doesn't init self.logger before super()
+        # so we rely on kwargs or the default LogLevel.INFO.
+        verbosity_level = kwargs.pop("verbosity_level", LogLevel.INFO)
+        grammar = kwargs.pop("grammar", None)
+        managed_agents = kwargs.pop("managed_agents", None) # Assuming this might be passed via kwargs
+        step_callbacks = kwargs.pop("step_callbacks", None)
+
+        # name and description can be passed via kwargs or default to None / class name
+        name = kwargs.pop("name", self.__class__.__name__)
+        description = kwargs.pop("description", None)
+
+
         super().__init__(
             tools=tools,
             model=model,
+            config=None,
             prompt_templates=prompt_templates,
+            max_steps=max_steps,
+            add_base_tools=add_base_tools,
+            verbosity_level=verbosity_level,
+            grammar=grammar,
+            managed_agents=managed_agents,
+            step_callbacks=step_callbacks,
             planning_interval=planning_interval,
+            name=name,
+            description=description,
             **kwargs,
         )
 
-    def initialize_system_prompt(self) -> str:
-        system_prompt = populate_template(
-            self.prompt_templates["system_prompt"],
-            variables={"tools": self.tools, "managed_agents": self.managed_agents},
-        )
-        return system_prompt
-
-    def step(self, memory_step: ActionStep) -> None | Any:
-        """
-        Perform one step in the ReAct framework: the agent thinks, acts, and observes the result.
-        Returns None if the step is not final.
-        """
-        memory_messages = self.write_memory_to_messages()
-
-        input_messages = memory_messages.copy()
-
-        # Add new step in logs
-        memory_step.model_input_messages = input_messages
-
-        try:
-            chat_message: ChatMessage = self.model(
-                input_messages,
-                stop_sequences=["Observation:", "Calling tools:"],
-                tools_to_call_from=list(self.tools.values()),
-            )
-            memory_step.model_output_message = chat_message
-            model_output = chat_message.content
-            self.logger.log_markdown(
-                content=model_output if model_output else str(chat_message.raw),
-                title="Output message of the LLM:",
-                level=LogLevel.DEBUG,
-            )
-
-            memory_step.model_output_message.content = model_output
-            memory_step.model_output = model_output
-        except Exception as e:
-            raise AgentGenerationError(f"Error while generating output:\n{e}", self.logger) from e
-
-        if chat_message.tool_calls is None or len(chat_message.tool_calls) == 0:
-            try:
-                chat_message = self.model.parse_tool_calls(chat_message)
-            except Exception as e:
-                raise AgentParsingError(f"Error while parsing tool call from model output: {e}", self.logger)
-        else:
-            for tool_call in chat_message.tool_calls:
-                tool_call.function.arguments = parse_json_if_needed(tool_call.function.arguments)
-        tool_call = chat_message.tool_calls[0]  # type: ignore
-        tool_name, tool_call_id = tool_call.function.name, tool_call.id
-        tool_arguments = tool_call.function.arguments
-        memory_step.model_output = str(f"Called Tool: '{tool_name}' with arguments: {tool_arguments}")
-        memory_step.tool_calls = [ToolCall(name=tool_name, arguments=tool_arguments, id=tool_call_id)]
-
-        # Execute
-        self.logger.log(
-            Panel(Text(f"Calling tool: '{tool_name}' with arguments: {tool_arguments}")),
-            level=LogLevel.INFO,
-        )
-        if tool_name == "final_answer":
-            if isinstance(tool_arguments, dict):
-                if "answer" in tool_arguments:
-                    answer = tool_arguments["answer"]
-                else:
-                    answer = tool_arguments
-            else:
-                answer = tool_arguments
-            if (
-                isinstance(answer, str) and answer in self.state.keys()
-            ):  # if the answer is a state variable, return the value
-                final_answer = self.state[answer]
-                self.logger.log(
-                    f"[bold {YELLOW_HEX}]Final answer:[/bold {YELLOW_HEX}] Extracting key '{answer}' from state to return value '{final_answer}'.",
-                    level=LogLevel.INFO,
-                )
-            else:
-                final_answer = answer
-                self.logger.log(
-                    Text(f"Final answer: {final_answer}", style=f"bold {YELLOW_HEX}"),
-                    level=LogLevel.INFO,
-                )
-
-            memory_step.action_output = final_answer
-            return final_answer
-        else:
-            if tool_arguments is None:
-                tool_arguments = {}
-            observation = self.execute_tool_call(tool_name, tool_arguments)
-            observation_type = type(observation)
-            if observation_type in [AgentImage, AgentAudio]:
-                if observation_type == AgentImage:
-                    observation_name = "image.png"
-                elif observation_type == AgentAudio:
-                    observation_name = "audio.mp3"
-                # TODO: observation naming could allow for different names of same type
-
-                self.state[observation_name] = observation
-                updated_information = f"Stored '{observation_name}' in memory."
-            else:
-                updated_information = str(observation).strip()
-            self.logger.log(
-                f"Observations: {updated_information.replace('[', '|')}",  # escape potential rich-tag-like components
-                level=LogLevel.INFO,
-            )
-            memory_step.observations = updated_information
-            return None
-
-    def _substitute_state_variables(self, arguments: dict[str, str] | str) -> dict[str, Any] | str:
-        """Replace string values in arguments with their corresponding state values if they exist."""
-        if isinstance(arguments, dict):
-            return {
-                key: self.state.get(value, value) if isinstance(value, str) else value
-                for key, value in arguments.items()
-            }
-        return arguments
-
-    def execute_tool_call(self, tool_name: str, arguments: dict[str, str] | str) -> Any:
-        """
-        Execute a tool or managed agent with the provided arguments.
-
-        The arguments are replaced with the actual values from the state if they refer to state variables.
-
-        Args:
-            tool_name (`str`): Name of the tool or managed agent to execute.
-            arguments (dict[str, str] | str): Arguments passed to the tool call.
-        """
-        # Check if the tool exists
-        available_tools = {**self.tools, **self.managed_agents}
-        if tool_name not in available_tools:
-            raise AgentToolExecutionError(
-                f"Unknown tool {tool_name}, should be one of: {', '.join(available_tools)}.", self.logger
-            )
-
-        # Get the tool and substitute state variables in arguments
-        tool = available_tools[tool_name]
-        arguments = self._substitute_state_variables(arguments)
-        is_managed_agent = tool_name in self.managed_agents
-
-        try:
-            # Call tool with appropriate arguments
-            if isinstance(arguments, dict):
-                return tool(**arguments) if is_managed_agent else tool(**arguments, sanitize_inputs_outputs=True)
-            elif isinstance(arguments, str):
-                return tool(arguments) if is_managed_agent else tool(arguments, sanitize_inputs_outputs=True)
-            else:
-                raise TypeError(f"Unsupported arguments type: {type(arguments)}")
-
-        except TypeError as e:
-            # Handle invalid arguments
-            description = getattr(tool, "description", "No description")
-            if is_managed_agent:
-                error_msg = (
-                    f"Invalid request to team member '{tool_name}' with arguments {json.dumps(arguments, ensure_ascii=False)}: {e}\n"
-                    "You should call this team member with a valid request.\n"
-                    f"Team member description: {description}"
-                )
-            else:
-                error_msg = (
-                    f"Invalid call to tool '{tool_name}' with arguments {json.dumps(arguments, ensure_ascii=False)}: {e}\n"
-                    "You should call this tool with correct input arguments.\n"
-                    f"Expected inputs: {json.dumps(tool.parameters)}\n"
-                    f"Returns output type: {tool.output_type}\n"
-                    f"Tool description: '{description}'"
-                )
-            raise AgentToolCallError(error_msg, self.logger) from e
-
-        except Exception as e:
-            # Handle execution errors
-            if is_managed_agent:
-                error_msg = (
-                    f"Error executing request to team member '{tool_name}' with arguments {json.dumps(arguments)}: {e}\n"
-                    "Please try again or request to another team member"
-                )
-            else:
-                error_msg = (
-                    f"Error executing tool '{tool_name}' with arguments {json.dumps(arguments)}: {type(e).__name__}: {e}\n"
-                    "Please try again or use another tool"
-                )
-            raise AgentToolExecutionError(error_msg, self.logger) from e
+    # initialize_system_prompt is removed
+    # step method is removed (now inherited from AsyncMultiStepAgent)
+    # _substitute_state_variables method is removed (now inherited from AsyncMultiStepAgent)
+    # execute_tool_call method is removed (now inherited from AsyncMultiStepAgent)
