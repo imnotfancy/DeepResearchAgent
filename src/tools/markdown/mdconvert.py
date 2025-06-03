@@ -40,7 +40,8 @@ def transcribe_audio(file_stream, audio_format):
             }
             response = requests.post(proxy_url, headers=headers, files=files)
     else:
-        logger.error(f"Invalid proxy URL: {proxy_url}")
+        sanitized_proxy_url = proxy_url.replace('\r\n', '').replace('\n', '')
+        logger.error(f"Invalid proxy URL: {sanitized_proxy_url}")
         raise ValueError("Untrusted proxy URL provided.")
     else:
         response = transcription(model="gpt-4o-transcribe", file=file_stream)
